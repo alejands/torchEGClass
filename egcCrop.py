@@ -1,8 +1,8 @@
-# egcCropCompare.py
+# egcCrop.py
 # Author: Alejandro Sanchez
-# July 2018
+# Created: Jul 3, 2018
 #
-# Unfinished implementation of cropping full sized images.
+# Testing classifier with variable smaller crop sizes
 
 import numpy as np
 import h5py
@@ -19,10 +19,11 @@ photon_input_file = "SinglePhotonFlatPt10To160_2016_25ns_Moriond17MC_PoissonOOTP
 validation_fraction = 0.15
 num_epochs = 20
 use_gpu = True
-crop_size = 32
+crop_size = 16
 
 ### Prepare Data ###
 print("Fetching data...")
+assert crop_size > 0 and crop_size <= 32
 
 class myData(Dataset):
     '''
@@ -30,41 +31,41 @@ class myData(Dataset):
     sets.
     '''
 
-    def __init__(self, data_file, val_cut_):
-        self.f = h5py.File(data_file, 'r')
-        #self.inputs = torch.tensor(f['X_crop0'][:]).view(-1, 1, 32, 32)
-        #self.inputs = torch.tensor(f['X'][:]).view(-1, 1, 170, 360)
-        self.inputs = self.f['X']
-        self.targets = torch.tensor(self.f['y'][:]).view(-1)
-        self.pt_ = torch.tensor(self.f['pho_pT0'][:]).view(-1)
-        self.val_cut = val_cut_
+    def __init__(self, data_file, val_cut):
+        f = h5py.File(data_file, 'r')
+        self.inputs = torch.tensor(f['X_crop0'][:]).view(-1, 1, 32, 32)
+        #answers = torch.tensor(f['y'][:], dtype=torch.int).view(-1)
+        #self.targets = torch.zeros(len(answers), 2)
+        #for i, entry in enumerate(self.targets):
+        #    entry[answers[i]] = 1.0
+        self.targets = torch.tensor(f['y'][:], dtype=torch.float).view(-1)
+        self.pt_ = torch.tensor(f['pho_pT0'][:]).view(-1)
 
-        #self.trainset = [self.inputs[self.valCut(val_cut):], 
-        #                 self.targets[self.valCut(val_cut):],
-        #                 self.pt_[self.valCut(val_cut):]]
-        #self.valset = [self.inputs[:self.valCut(val_cut)], 
-        #               self.targets[:self.valCut(val_cut)],
-        #               self.pt_[:self.valCut(val_cut)]]
-        #self.use_train_set = True
+        self.trainset = [self.inputs[self.valCut(val_cut):], 
+                         self.targets[self.valCut(val_cut):],
+                         self.pt_[self.valCut(val_cut):]]
+        self.valset = [self.inputs[:self.valCut(val_cut)], 
+                       self.targets[:self.valCut(val_cut)],
+                       self.pt_[:self.valCut(val_cut)]]
+        self.use_train_set = True
+        self.cropped = False
 
     def __len__(self):
         if self.use_train_set:
-            return len(self.targets[self.valCut():])
+            return len(self.trainset[0])
         else:
-            return len(self.targets[:self.valCut()])
+            return len(self.valset[0])
 
     def __getitem__(self, index):
-        if index >= len(self):
-            raise IndexError
         if self.use_train_set:
-            index += self.valCut()
-        #print(torch.tensor(self.f['X'][index][:]).view(-1, 1, 170, 360))
-        return torch.tensor(self.f['X'][index][:]).view(-1, 1, 170, 360),\
-               self.targets[index],\
-               self.pt_[index]
+            return self.trainset[0][index], self.trainset[1][index],\
+                    self.trainset[2][index]
+        else:
+            return self.valset[0][index], self.valset[1][index],\
+                    self.valset[2][index]
 
-    def valCut(self):
-        return int(len(self.inputs) * self.val_cut)
+    def valCut(self, fraction):
+        return int(len(self.inputs) * fraction)
 
     def useTrainSet(self, use_train_set_):
         '''
@@ -73,8 +74,29 @@ class myData(Dataset):
         '''
         self.use_train_set = use_train_set_
 
+    def crop(self, newSize):
+        assert newSize > 0 and newSize <= 32
+        if self.cropped:
+            print("warning: dataset already cropped. skipping crop()")
+            return
+        
+        print("cropping images to {}x{}".format(newSize, newSize))
+        oldImgs = self.inputs
+        self.inputs = torch.empty(len(oldImgs), 1, newSize, newSize)
+        for i, img in enumerate(oldImgs):
+            if newSize % 2 == 0:
+                self.inputs[i] = img[:, (16 - newSize//2):(16 + newSize//2),
+                                        (16 - newSize//2):(16 + newSize//2)]
+            else:
+                self.inputs[i] = img[:, (16 - newSize//2 - 1):(16 + newSize//2),
+                                        (16 - newSize//2 - 1):(16 + newSize//2)]
+        self.cropped = True
+        return
+
 ele_data = myData(electron_input_file, validation_fraction)
 pho_data = myData(photon_input_file, validation_fraction)
+ele_data.crop(crop_size)
+pho_data.crop(crop_size)
 ele_data.useTrainSet(True)
 pho_data.useTrainSet(True)
 train_data = ConcatDataset((ele_data, pho_data))
@@ -98,36 +120,7 @@ class Item(nn.Module):
     def forward(self, x):
         return x.view(-1)
 
-# reduces 170x360 image to a cropped version centered at the peak
-class Crop(nn.Module):
-    def __init__(self, _size):
-        super(Crop, self).__init__()
-        self.size = _size
-        self.radius = self.size//2
-
-    def forward(self, x):
-        # find peak of 170x360 image
-        _, peak = x.view(-1).max()
-        peak = np.unravel_index(peak, (170,360))
-
-        eta_min, eta_max = peak[0] - self.radius, peak[0] + self.radius
-        phi_min, phi_max = peak[1] - self.radius, peak[1] + self.radius
-        
-        # for even crop size, adjust frame and padding accordingly
-        if self.size % 2 == 0:
-            eta_max += 1
-            phi_max += 1
-            self.radius += 1
-
-        # pad and crop
-        pad = nn.ReflectionPad2d(self.radius)
-        x = pad(x)
-        x = x[(self.radius + eta_min):(self.radius + eta_max),
-                 (self.radius + phi_min):(self.radius + phi_max)]
-        return x
-
 net = nn.Sequential(
-    Crop(crop_size),
     nn.Conv2d( 1, 16, 3),
     nn.ReLU(),
     nn.Conv2d(16, 16, 3),
